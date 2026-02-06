@@ -10,15 +10,31 @@
 
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import fetch from 'node-fetch';
 import crypto from 'crypto';
 import * as cheerio from 'cheerio';
 import Redis from 'ioredis';
+import pg from 'pg';
 
 const app = express();
 app.use(express.json({ limit: '100kb' }));
 
 const PORT = process.env.PORT || 3000;
+
+const { Pool } = pg;
+const DATABASE_URL = process.env.DATABASE_URL;
+const IS_PROD = process.env.NODE_ENV === 'production';
+
+if (IS_PROD && !DATABASE_URL) {
+  console.error('Missing DATABASE_URL in production. Refusing to start.');
+  process.exit(1);
+}
+
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.PGSSLMODE === 'disable' ? false : undefined,
+    })
+  : null;
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'YOUR_GOOGLE_CLIENT_ID';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'YOUR_GOOGLE_CLIENT_SECRET';
@@ -817,7 +833,22 @@ app.get('/edsby/ping', (req, res) => {
   return res.status(200).json({ linked });
 });
 
-app.listen(PORT, () => {
-  console.log(`Auth backend listening on port ${PORT}`);
-  console.log(`Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET and deploy.`);
-});
+async function start() {
+  if (pool) {
+    try {
+      await pool.query('SELECT 1');
+      console.log('[db] Postgres connectivity OK');
+    } catch (e) {
+      console.error('[db] Postgres connectivity failed');
+      console.error(e);
+      if (IS_PROD) process.exit(1);
+    }
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Auth backend listening on port ${PORT}`);
+    console.log(`Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET and deploy.`);
+  });
+}
+
+start();
