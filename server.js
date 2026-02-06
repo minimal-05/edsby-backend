@@ -55,8 +55,26 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'YOUR_GOOGLE_CLIENT_ID'
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'YOUR_GOOGLE_CLIENT_SECRET';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-jwt-secret-change-in-production';
 const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET || JWT_SECRET;
-const ACCESS_TOKEN_TTL_SECONDS = Number(process.env.ACCESS_TOKEN_TTL_SECONDS || 15 * 60);
-const REFRESH_TOKEN_TTL_SECONDS = Number(process.env.REFRESH_TOKEN_TTL_SECONDS || 30 * 24 * 60 * 60);
+const ACCESS_TOKEN_TTL_SECONDS_RAW = process.env.ACCESS_TOKEN_TTL_SECONDS;
+const REFRESH_TOKEN_TTL_SECONDS_RAW = process.env.REFRESH_TOKEN_TTL_SECONDS;
+
+const ACCESS_TOKEN_TTL_SECONDS = Number.parseInt(
+  (ACCESS_TOKEN_TTL_SECONDS_RAW ?? String(15 * 60)).trim(),
+  10
+);
+const REFRESH_TOKEN_TTL_SECONDS = Number.parseInt(
+  (REFRESH_TOKEN_TTL_SECONDS_RAW ?? String(30 * 24 * 60 * 60)).trim(),
+  10
+);
+
+if (!Number.isFinite(ACCESS_TOKEN_TTL_SECONDS) || ACCESS_TOKEN_TTL_SECONDS <= 0) {
+  console.error('Invalid ACCESS_TOKEN_TTL_SECONDS:', ACCESS_TOKEN_TTL_SECONDS_RAW);
+  throw new Error('invalid_access_token_ttl');
+}
+if (!Number.isFinite(REFRESH_TOKEN_TTL_SECONDS) || REFRESH_TOKEN_TTL_SECONDS <= 0) {
+  console.error('Invalid REFRESH_TOKEN_TTL_SECONDS:', REFRESH_TOKEN_TTL_SECONDS_RAW);
+  throw new Error('invalid_refresh_token_ttl');
+}
 const APP_CALLBACK = process.env.APP_CALLBACK || 'edsbyai://auth-callback';
 
 /** Session store: sessionId -> { school, studentId, cookieHeader }. Use Redis in production. */
@@ -958,7 +976,12 @@ app.get('/edsby/all', async (req, res) => {
 
   const { session, school, studentId } = ctx;
 
+  console.log('[edsby] /edsby/all using studentId:', studentId, 'school:', school);
+
   const baseStudentRes = await fetchEdsbyHtml({ school, cookieHeader: session.cookieHeader, path: `/p/BaseStudent/${studentId}` });
+  console.log('[edsby] BaseStudent status:', baseStudentRes.status);
+  console.log('[edsby] BaseStudent preview (first 800 chars):', baseStudentRes.body.slice(0, 800));
+
   if (baseStudentRes.status < 200 || baseStudentRes.status >= 300) {
     if (isEdsbySessionRequiredStatus(baseStudentRes.status)) {
       return res.status(503).json({ error: 'edsby_session_required' });
@@ -968,6 +991,8 @@ app.get('/edsby/all', async (req, res) => {
 
   const courses = extractCourseIdsAndNames(baseStudentRes.body);
   const schedule = extractScheduleItems(baseStudentRes.body);
+
+  console.log('[edsby] Extracted courses count:', courses.length, 'schedule count:', schedule.length);
 
   const details = await Promise.all(
     courses.map(async (c) => {
