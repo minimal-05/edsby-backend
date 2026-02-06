@@ -741,7 +741,8 @@ app.post('/auth/edsby-cookies', async (req, res) => {
 
   const exists = await edsbySessionExists(sessionId);
   if (!exists) {
-    return res.status(400).json({ error: 'session_not_found' });
+    // Auto-create a lightweight session so cookie bridge can work on first use
+    await edsbySessionPut(sessionId, { school: payload.school || 'asij', studentId: payload.studentId || '', cookieHeader: '' });
   }
 
   const { cookies: rawCookies, studentId: newStudentId } = req.body || {};
