@@ -31,7 +31,20 @@ const PORT = process.env.PORT || 3000;
 const { Pool } = pg;
 const DATABASE_URL = process.env.DATABASE_URL;
 const IS_PROD = process.env.NODE_ENV === 'production';
-const COOKIE_ENCRYPTION_KEY = process.env.EDSBY_COOKIE_ENCRYPTION_KEY;
+const crypto = require('crypto');
+
+/**
+ * Derive a 32-byte AES-GCM key from JWT_SECRET using HKDF-SHA256.
+ * This removes the need for a separate COOKIE_ENCRYPTION_KEY env var.
+ */
+function deriveCookieEncryptionKey() {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) throw new Error('JWT_SECRET is required to derive cookie encryption key');
+  // Use HKDF with empty salt and info 'edsby-cookie-enc' to derive a 32-byte key
+  return crypto.hkdfSync('sha256', secret, '', 'edsby-cookie-enc', 32);
+}
+
+const COOKIE_ENCRYPTION_KEY = deriveCookieEncryptionKey();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 if (IS_PROD && !DATABASE_URL) {
@@ -39,8 +52,8 @@ if (IS_PROD && !DATABASE_URL) {
   process.exit(1);
 }
 
-if (IS_PROD && !COOKIE_ENCRYPTION_KEY) {
-  console.error('Missing COOKIE_ENCRYPTION_KEY in production. Refusing to start.');
+if (IS_PROD && !process.env.JWT_SECRET) {
+  console.error('Missing JWT_SECRET in production. Refusing to start.');
   process.exit(1);
 }
 
@@ -152,23 +165,10 @@ async function dbUpsertEdsbyLink({ userId, school, status, numericStudentId, coo
   );
 }
 
-function requireCookieEncryptionKey() {
-  if (!COOKIE_ENCRYPTION_KEY || typeof COOKIE_ENCRYPTION_KEY !== 'string') {
-    const err = new Error('cookie_encryption_key_missing');
-    err.code = 'cookie_encryption_key_missing';
-    throw err;
-  }
-  const keyBuf = Buffer.from(COOKIE_ENCRYPTION_KEY, 'base64');
-  if (keyBuf.length !== 32) {
-    const err = new Error('cookie_encryption_key_invalid');
-    err.code = 'cookie_encryption_key_invalid';
-    throw err;
-  }
-  return keyBuf;
-}
+// COOKIE_ENCRYPTION_KEY is now derived from JWT_SECRET; no need for requireCookieEncryptionKey
 
 function encryptCookiePayload(cookiePayload) {
-  const key = requireCookieEncryptionKey();
+  const key = COOKIE_ENCRYPTION_KEY; // Already a Buffer from deriveCookieEncryptionKey
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const plaintext = Buffer.from(JSON.stringify(cookiePayload), 'utf8');
@@ -184,6 +184,8 @@ function extractNumericBaseStudentIdFromHtml(html) {
     /BaseStudent\/([0-9]{4,})/i,
     /BaseStudent\\\/([0-9]{4,})/i,
     /baseStudentId"\s*:\s*"?([0-9]{4,})"?/i,
+    // Fallback: look for any 4+ digit number that appears in a link or script context
+    /(?:href|url|student|user)\D*([0-9]{4,})/i,
   ];
   for (const re of patterns) {
     const m = re.exec(html);
@@ -459,8 +461,9 @@ async function resolveEdsbyStudentId(school, googleIdToken) {
  * Body: { cookies: [ { name, value, domain } ], studentId?: string }
  * Header: Authorization: Bearer <jwt>
  * Stores Edsby cookies for this session so /api/proxy can use them.
+ * Now derives encryption key from JWT_SECRET, eliminating env var dependency.
  */
-app.post('/auth/edsby-cookies', (req, res) => {
+app.post('/auth/edsby-cookies', async (req, res) => {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'missing_token' });
@@ -477,78 +480,83 @@ app.post('/auth/edsby-cookies', (req, res) => {
     return res.status(400).json({ error: 'session_not_found' });
   }
 
-  Promise.resolve(edsbySessionExists(sessionId)).then((exists) => {
-    if (!exists) {
-      return res.status(400).json({ error: 'session_not_found' });
-    }
+  const exists = await edsbySessionExists(sessionId);
+  if (!exists) {
+    return res.status(400).json({ error: 'session_not_found' });
+  }
 
-    const { cookies: rawCookies, studentId: newStudentId } = req.body || {};
-    if (!Array.isArray(rawCookies) || rawCookies.length === 0) {
-      return res.status(400).json({ error: 'cookies_required' });
-    }
+  const { cookies: rawCookies, studentId: newStudentId } = req.body || {};
+  if (!Array.isArray(rawCookies) || rawCookies.length === 0) {
+    return res.status(400).json({ error: 'cookies_required' });
+  }
 
-    const cookieHeader = rawCookies
-      .map((c) => (c && c.name && c.value != null ? `${c.name}=${String(c.value)}` : null))
-      .filter(Boolean)
-      .join('; ');
+  const cookieHeader = rawCookies
+    .map((c) => (c && c.name && c.value != null ? `${c.name}=${String(c.value)}` : null))
+    .filter(Boolean)
+    .join('; ');
 
-    Promise.resolve(edsbySessionGet(sessionId)).then(async (session) => {
-      const next = session || { school: payload.school || 'asij', studentId: payload.studentId || '', cookieHeader: '' };
-      next.cookieHeader = cookieHeader;
-      if (newStudentId && typeof newStudentId === 'string') {
-        next.studentId = newStudentId;
-      }
+  const session = await edsbySessionGet(sessionId);
+  const next = session || { school: payload.school || 'asij', studentId: payload.studentId || '', cookieHeader: '' };
+  next.cookieHeader = cookieHeader;
+  if (newStudentId && typeof newStudentId === 'string') {
+    next.studentId = newStudentId;
+  }
 
-      let numericStudentId = null;
-      try {
-        const baseStudentRes = await fetchEdsbyHtml({
-          school: next.school || payload.school || 'asij',
-          cookieHeader: next.cookieHeader,
-          path: '/',
-        });
-        if (baseStudentRes.status >= 200 && baseStudentRes.status < 300) {
-          numericStudentId = extractNumericBaseStudentIdFromHtml(baseStudentRes.body);
-          if (numericStudentId) {
-            next.studentId = numericStudentId;
-          }
-        }
-      } catch (e) {
-        console.error('[edsby] numeric student id resolve failed');
-        console.error(e);
-      }
-
-      await edsbySessionPut(sessionId, next);
-
-      try {
-        const encrypted = encryptCookiePayload(rawCookies);
-        await dbUpsertEdsbyLink({
-          userId: payload.sub,
-          school: (next.school || payload.school || 'asij').toLowerCase(),
-          status: 'linked',
-          numericStudentId: numericStudentId,
-          cookieJarEncrypted: encrypted,
-          linkedAt: new Date(),
-          lastValidatedAt: numericStudentId ? new Date() : null,
-        });
-      } catch (e) {
-        console.error('[db] failed to persist edsby link');
-        console.error(e);
-        if (IS_PROD) {
-          return res.status(500).json({ error: 'server_error' });
-        }
-      }
-
-      return res.status(200).json({ ok: true, studentId: next.studentId || null });
-    }).catch((e) => {
-      console.error('edsbySessionGet/Put failed', e);
-      return res.status(500).json({ error: 'server_error' });
+  let numericStudentId = null;
+  try {
+    // Try to resolve numeric student ID from homepage first
+    const homeRes = await fetchEdsbyHtml({
+      school: next.school || payload.school || 'asij',
+      cookieHeader: next.cookieHeader,
+      path: '/',
     });
-  }).catch((e) => {
-    console.error('edsbySessionExists failed', e);
-    return res.status(500).json({ error: 'server_error' });
-  });
+    if (homeRes.status >= 200 && homeRes.status < 300) {
+      numericStudentId = extractNumericBaseStudentIdFromHtml(homeRes.body);
+      if (numericStudentId) {
+        next.studentId = numericStudentId;
+      }
+    }
+    // If not found, try BaseStudent page as fallback
+    if (!numericStudentId) {
+      const baseStudentRes = await fetchEdsbyHtml({
+        school: next.school || payload.school || 'asij',
+        cookieHeader: next.cookieHeader,
+        path: `/p/BaseStudent/${next.studentId}`,
+      });
+      if (baseStudentRes.status >= 200 && baseStudentRes.status < 300) {
+        numericStudentId = extractNumericBaseStudentIdFromHtml(baseStudentRes.body);
+        if (numericStudentId) {
+          next.studentId = numericStudentId;
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[edsby] numeric student id resolve failed');
+    console.error(e);
+  }
 
-  return;
+  await edsbySessionPut(sessionId, next);
+
+  try {
+    const encrypted = encryptCookiePayload(rawCookies);
+    await dbUpsertEdsbyLink({
+      userId: payload.sub,
+      school: (next.school || payload.school || 'asij').toLowerCase(),
+      status: 'linked',
+      numericStudentId: numericStudentId,
+      cookieJarEncrypted: encrypted,
+      linkedAt: new Date(),
+      lastValidatedAt: numericStudentId ? new Date() : null,
+    });
+  } catch (e) {
+    console.error('[db] failed to persist edsby link');
+    console.error(e);
+    if (IS_PROD) {
+      return res.status(500).json({ error: 'server_error' });
+    }
+  }
+
+  return res.status(200).json({ ok: true, studentId: next.studentId || null });
 });
 
 function getBaseUrl(req) {
