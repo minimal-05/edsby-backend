@@ -102,6 +102,8 @@ const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
 const OAUTH_STATE_TTL_SECONDS = Number(process.env.OAUTH_STATE_TTL_SECONDS || 10 * 60);
 const EDSBY_SESSION_TTL_SECONDS = Number(process.env.EDSBY_SESSION_TTL_SECONDS || 30 * 24 * 60 * 60);
 
+const EDSBY_DEBUG = process.env.EDSBY_DEBUG === '1';
+
 async function dbQuery(text, params) {
   if (!pool) {
     const err = new Error('db_unavailable');
@@ -837,8 +839,10 @@ async function requireAccessSession(req, res) {
 async function fetchEdsbyHtml({ school, cookieHeader, path }) {
   const base = `https://${school}.edsby.com`;
   const url = base + path;
-  console.log(`[edsby] Fetching Edsby URL: ${url}`);
-  console.log(`[edsby] Cookie header length: ${cookieHeader ? cookieHeader.length : 0}`);
+  if (EDSBY_DEBUG) {
+    console.log(`[edsby] Fetching Edsby URL: ${url}`);
+    console.log(`[edsby] Cookie header length: ${cookieHeader ? cookieHeader.length : 0}`);
+  }
   const res = await fetch(url, {
     headers: {
       Cookie: cookieHeader,
@@ -848,8 +852,10 @@ async function fetchEdsbyHtml({ school, cookieHeader, path }) {
     redirect: 'follow',
   });
   const body = await res.text();
-  console.log(`[edsby] Response status: ${res.status}`);
-  console.log(`[edsby] Response preview (first 800 chars): ${body.slice(0, 800)}`);
+  if (EDSBY_DEBUG) {
+    console.log(`[edsby] Response status: ${res.status}`);
+    console.log(`[edsby] Response preview (first 800 chars): ${body.slice(0, 800)}`);
+  }
   return { status: res.status, headers: res.headers, body };
 }
 
@@ -898,7 +904,9 @@ async function fetchEdsbyRenderedHtml({ school, cookieHeader, path }) {
     await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
     const html = await page.content();
     console.log(`[edsby] (playwright) Rendered HTML length: ${html.length}`);
-    console.log(`[edsby] (playwright) Rendered preview (first 800 chars): ${html.slice(0, 800)}`);
+    if (EDSBY_DEBUG) {
+      console.log(`[edsby] (playwright) Rendered preview (first 800 chars): ${html.slice(0, 800)}`);
+    }
     await context.close();
     return { status: 200, headers: new Map(), body: html };
   } catch (e) {
@@ -914,24 +922,26 @@ function isEdsbySessionRequiredStatus(status) {
 }
 
 function extractCourseIdsAndNames(html) {
-  console.log('[edsby] extractCourseIdsAndNames: parsing HTML (first 2000 chars):', html.slice(0, 2000));
+  if (EDSBY_DEBUG) {
+    console.log('[edsby] extractCourseIdsAndNames: parsing HTML (first 2000 chars):', html.slice(0, 2000));
+  }
   const $ = cheerio.load(html);
   // Primary selector: direct course links
   let links = $('a[href^="/p/Course/"]');
-  console.log('[edsby] Primary selector found links:', links.length);
+  if (EDSBY_DEBUG) console.log('[edsby] Primary selector found links:', links.length);
   if (links.length === 0) {
     // Fallback selectors
     links = $('.course-card a');
-    console.log('[edsby] Fallback .course-card a found links:', links.length);
+    if (EDSBY_DEBUG) console.log('[edsby] Fallback .course-card a found links:', links.length);
     if (links.length === 0) {
       links = $('[data-course-id]');
-      console.log('[edsby] Fallback [data-course-id] found links:', links.length);
+      if (EDSBY_DEBUG) console.log('[edsby] Fallback [data-course-id] found links:', links.length);
       if (links.length === 0) {
         links = $('a[href*="/p/Course/"]');
-        console.log('[edsby] Fallback a[href*="/p/Course/"] found links:', links.length);
+        if (EDSBY_DEBUG) console.log('[edsby] Fallback a[href*="/p/Course/"] found links:', links.length);
         if (links.length === 0) {
           links = $('a[href*="Course/"]');
-          console.log('[edsby] Fallback a[href*="Course/"] found links:', links.length);
+          if (EDSBY_DEBUG) console.log('[edsby] Fallback a[href*="Course/"] found links:', links.length);
         }
       }
     }
@@ -948,7 +958,7 @@ function extractCourseIdsAndNames(html) {
 
   // If still no courses, try regex patterns
   if (courses.length === 0) {
-    console.log('[edsby] No links found, trying regex patterns');
+    if (EDSBY_DEBUG) console.log('[edsby] No links found, trying regex patterns');
     const patterns = [
       /\/p\/Course\/([A-Za-z0-9_-]+)/gi,
       /\\\/p\\\/Course\\\/([A-Za-z0-9_-]+)/gi,
@@ -968,7 +978,7 @@ function extractCourseIdsAndNames(html) {
       }
     }
 
-    console.log('[edsby] Regex patterns extracted IDs:', Array.from(ids));
+    if (EDSBY_DEBUG) console.log('[edsby] Regex patterns extracted IDs:', Array.from(ids));
     ids.forEach(id => courses.push({ id, name: 'Course', currentGrade: null }));
   }
 

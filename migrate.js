@@ -17,6 +17,31 @@ if (!DATABASE_URL) {
 
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: process.env.PGSSLMODE === 'disable' ? false : undefined });
 
+function isTransientDbError(e) {
+  const code = e && e.code ? String(e.code) : '';
+  // 57P03: the database system is starting up
+  // ECONNRESET: connection reset by peer (often during startup / failover)
+  return code === '57P03' || code === 'ECONNRESET';
+}
+
+async function withRetry(fn, { attempts, baseDelayMs }) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (!isTransientDbError(e) || i === attempts - 1) {
+        throw e;
+      }
+      const delay = baseDelayMs * Math.pow(2, i);
+      console.warn(`[migrate] transient db error (${e.code || e.message}); retrying in ${delay}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
 async function ensureMigrationsTable(client) {
   await client.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -45,16 +70,16 @@ async function applyMigration(client, id, sql) {
 }
 
 async function main() {
-  const client = await pool.connect();
+  const client = await withRetry(() => pool.connect(), { attempts: 6, baseDelayMs: 500 });
   try {
-    await ensureMigrationsTable(client);
+    await withRetry(() => ensureMigrationsTable(client), { attempts: 6, baseDelayMs: 500 });
 
     const migrationsDir = path.join(__dirname, 'migrations');
     const files = (await fs.readdir(migrationsDir))
       .filter((f) => f.endsWith('.sql'))
       .sort();
 
-    const applied = await getAppliedMigrations(client);
+    const applied = await withRetry(() => getAppliedMigrations(client), { attempts: 6, baseDelayMs: 500 });
 
     for (const file of files) {
       const id = file;
@@ -62,7 +87,7 @@ async function main() {
         continue;
       }
       const sql = await fs.readFile(path.join(migrationsDir, file), 'utf8');
-      await applyMigration(client, id, sql);
+      await withRetry(() => applyMigration(client, id, sql), { attempts: 6, baseDelayMs: 500 });
     }
 
     console.log('[migrate] done');
