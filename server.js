@@ -96,6 +96,12 @@ async function captureEdsbyJsonFromPage({ school, cookieHeader, url }) {
   return captured;
 }
 
+// Helper to extract the actual student query param used by Edsby for grades
+function extractStudentIdFromGradesUrl(url) {
+  const u = new URL(url);
+  return u.searchParams.get('student');
+}
+
 function extractPostsFromCapturedJson(captures, courseId) {
   // Heuristic: find arrays of feed-like items with title/subject and body/content.
   const posts = [];
@@ -1318,12 +1324,20 @@ app.get('/edsby/course/:courseId/grades', async (req, res) => {
 
   const url = `https://${school}.edsby.com/p/MyWorkStudent/${courseId}?student=${encodeURIComponent(studentId)}`;
 
-  // JSON/XHR first
+  // JSON/XHR first; also capture the real studentId Edsby uses
+  let realStudentId = studentId;
   try {
     const captures = await captureEdsbyJsonFromPage({ school, cookieHeader: session.cookieHeader, url });
+    for (const c of captures) {
+      const extracted = extractStudentIdFromGradesUrl(c.url);
+      if (extracted && /^\d+$/.test(extracted)) {
+        realStudentId = extracted;
+        break;
+      }
+    }
     const grades = extractAssignmentsFromCapturedJson(captures, courseId);
     if (grades.length) {
-      return res.status(200).json({ courseId, grades, source: 'xhr' });
+      return res.status(200).json({ courseId, grades, source: 'xhr', studentId: realStudentId });
     }
   } catch (e) {
     console.error('[edsby] grades xhr capture failed', e);
@@ -1333,7 +1347,7 @@ app.get('/edsby/course/:courseId/grades', async (req, res) => {
   const htmlRes = await fetchEdsbyHtml({
     school,
     cookieHeader: session.cookieHeader,
-    path: `/p/MyWorkStudent/${courseId}?student=${encodeURIComponent(studentId)}`,
+    path: `/p/MyWorkStudent/${courseId}?student=${encodeURIComponent(realStudentId)}`,
   });
   if (isEdsbySessionRequiredStatus(htmlRes.status)) {
     return res.status(503).json({ error: 'edsby_session_required' });
@@ -1343,7 +1357,7 @@ app.get('/edsby/course/:courseId/grades', async (req, res) => {
   }
 
   const grades = extractAssignments(htmlRes.body || '', courseId);
-  return res.status(200).json({ courseId, grades, source: 'html' });
+  return res.status(200).json({ courseId, grades, source: 'html', studentId: realStudentId });
 });
 
 app.get('/edsby/all', async (req, res) => {
