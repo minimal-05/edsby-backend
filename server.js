@@ -31,7 +31,7 @@ const PORT = process.env.PORT || 3000;
 const { Pool } = pg;
 const DATABASE_URL = process.env.DATABASE_URL;
 const IS_PROD = process.env.NODE_ENV === 'production';
-const COOKIE_ENCRYPTION_KEY = process.env.COOKIE_ENCRYPTION_KEY;
+const COOKIE_ENCRYPTION_KEY = process.env.EDSBY_COOKIE_ENCRYPTION_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 if (IS_PROD && !DATABASE_URL) {
