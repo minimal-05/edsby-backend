@@ -31,7 +31,6 @@ const PORT = process.env.PORT || 3000;
 const { Pool } = pg;
 const DATABASE_URL = process.env.DATABASE_URL;
 const IS_PROD = process.env.NODE_ENV === 'production';
-const crypto = require('crypto');
 
 /**
  * Derive a 32-byte AES-GCM key from JWT_SECRET using HKDF-SHA256.
