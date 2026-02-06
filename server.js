@@ -183,12 +183,30 @@ function extractNumericBaseStudentIdFromHtml(html) {
     /BaseStudent\/([0-9]{4,})/i,
     /BaseStudent\\\/([0-9]{4,})/i,
     /baseStudentId"\s*:\s*"?([0-9]{4,})"?/i,
-    // Fallback: look for any 4+ digit number that appears in a link or script context
+    // JSON in script tags
+    /(?:window|var|let|const)\s+(?:user|student|currentUser)\s*=\s*({[^}]+})/i,
+    // Meta tags
+    /<meta[^>]+name\s*=\s*["']?(?:edsby-)?student-id["']?\s+content\s*=\s*["']?([0-9]{4,})["']?/i,
+    // Data attributes
+    /data-(?:student|user)-id\s*=\s*["']?([0-9]{4,})["']?/i,
+    // Fallback: any 4+ digit number in link/script context
     /(?:href|url|student|user)\D*([0-9]{4,})/i,
   ];
   for (const re of patterns) {
     const m = re.exec(html);
     if (m && m[1]) return String(m[1]);
+  }
+  // Try to parse JSON from script if present
+  const jsonMatch = html.match(/(?:window|var|let|const)\s+(?:user|student|currentUser)\s*=\s*({[^}]+})/i);
+  if (jsonMatch) {
+    try {
+      const obj = eval('(' + jsonMatch[1] + ')');
+      if (obj && obj.id) return String(obj.id);
+      if (obj && obj.studentId) return String(obj.studentId);
+      if (obj && obj.userId) return String(obj.userId);
+    } catch (_) {
+      // ignore
+    }
   }
   return null;
 }
@@ -754,9 +772,23 @@ function isEdsbySessionRequiredStatus(status) {
   return status === 302 || status === 401 || status === 403;
 }
 
-function extractCourseIdsAndNames(baseStudentHtml) {
-  const $ = cheerio.load(baseStudentHtml);
-  const links = $('a[href^="/p/Course/"]');
+function extractCourseIdsAndNames(html) {
+  const $ = cheerio.load(html);
+  // Primary selector: direct course links
+  let links = $('a[href^="/p/Course/"]');
+  if (links.length === 0) {
+    // Fallback selectors
+    links = $('.course-card a');
+    if (links.length === 0) {
+      links = $('[data-course-id]');
+      if (links.length === 0) {
+        links = $('a[href*="/p/Course/"]');
+        if (links.length === 0) {
+          links = $('a[href*="Course/"]');
+        }
+      }
+    }
+  }
 
   const courses = [];
   links.each((_, el) => {
@@ -767,33 +799,36 @@ function extractCourseIdsAndNames(baseStudentHtml) {
     courses.push({ id, name: text || 'Course', currentGrade: null });
   });
 
+  // If still no courses, try regex patterns
+  if (courses.length === 0) {
+    const patterns = [
+      /\/p\/Course\/([A-Za-z0-9_-]+)/gi,
+      /\\\/p\\\/Course\\\/([A-Za-z0-9_-]+)/gi,
+      /\/p\/Course\?id=([A-Za-z0-9_-]+)/gi,
+      /\\\/p\\\/Course\?id=([A-Za-z0-9_-]+)/gi,
+      /\/Course\/([A-Za-z0-9_-]+)/gi,
+      /\\\/Course\\\/([A-Za-z0-9_-]+)/gi,
+      /courseId"\s*:\s*"([A-Za-z0-9_-]+)"/gi,
+      /course_id"\s*:\s*"([A-Za-z0-9_-]+)"/gi,
+    ];
+
+    const ids = new Set();
+    for (const re of patterns) {
+      let m;
+      while ((m = re.exec(html)) !== null) {
+        if (m[1]) ids.add(m[1]);
+      }
+    }
+
+    ids.forEach(id => courses.push({ id, name: 'Course', currentGrade: null }));
+  }
+
   const uniqueById = new Map();
   for (const c of courses) {
     if (!uniqueById.has(c.id)) uniqueById.set(c.id, c);
   }
 
-  if (uniqueById.size > 0) return Array.from(uniqueById.values());
-
-  const patterns = [
-    /\/p\/Course\/([A-Za-z0-9_-]+)/gi,
-    /\\\/p\\\/Course\\\/([A-Za-z0-9_-]+)/gi,
-    /\/p\/Course\?id=([A-Za-z0-9_-]+)/gi,
-    /\\\/p\\\/Course\?id=([A-Za-z0-9_-]+)/gi,
-    /\/Course\/([A-Za-z0-9_-]+)/gi,
-    /\\\/Course\\\/([A-Za-z0-9_-]+)/gi,
-    /courseId"\s*:\s*"([A-Za-z0-9_-]+)"/gi,
-    /course_id"\s*:\s*"([A-Za-z0-9_-]+)"/gi,
-  ];
-
-  const ids = new Set();
-  for (const re of patterns) {
-    let m;
-    while ((m = re.exec(baseStudentHtml)) !== null) {
-      if (m[1]) ids.add(m[1]);
-    }
-  }
-
-  return Array.from(ids).map((id) => ({ id, name: 'Course', currentGrade: null }));
+  return uniqueById.size > 0 ? Array.from(uniqueById.values()) : [];
 }
 
 function extractScheduleItems(baseStudentHtml) {
@@ -997,8 +1032,29 @@ app.get('/edsby/all', async (req, res) => {
     return res.status(502).json({ error: 'edsby_upstream_error', status: homeRes.status });
   }
 
-  const courses = extractCourseIdsAndNames(homeRes.body);
-  const schedule = extractScheduleItems(homeRes.body);
+  let courses = extractCourseIdsAndNames(homeRes.body);
+  let schedule = extractScheduleItems(homeRes.body);
+
+  // If homepage yields no courses, try other pages
+  if (courses.length === 0) {
+    console.log('[edsby] No courses on homepage, trying /p/');
+    const pRes = await fetchEdsbyHtml({ school, cookieHeader: session.cookieHeader, path: '/p/' });
+    if (pRes.status >= 200 && pRes.status < 300) {
+      courses = extractCourseIdsAndNames(pRes.body);
+      schedule = extractScheduleItems(pRes.body);
+      console.log('[edsby] Found courses on /p/:', courses.length);
+    }
+    // Fallback: try BaseStudent page with numeric ID
+    if (courses.length === 0 && /^\d+$/.test(String(studentId))) {
+      console.log('[edsby] No courses on /p/, trying BaseStudent page with numeric ID');
+      const baseRes = await fetchEdsbyHtml({ school, cookieHeader: session.cookieHeader, path: `/p/BaseStudent/${studentId}` });
+      if (baseRes.status >= 200 && baseRes.status < 300) {
+        courses = extractCourseIdsAndNames(baseRes.body);
+        schedule = extractScheduleItems(baseRes.body);
+        console.log('[edsby] Found courses on BaseStudent page:', courses.length);
+      }
+    }
+  }
 
   console.log('[edsby] Extracted courses count:', courses.length, 'schedule count:', schedule.length);
 
