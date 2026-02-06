@@ -1,30 +1,29 @@
 /**
- * Minimal backend for Edsby AI app (production-grade token exchange).
+ * Production backend for Edsby AI app.
  *
  * Flow:
- * 1. App opens GET /auth/start?school=asij
- * 2. Backend redirects to Google OAuth (or to Edsby login which uses Google)
- * 3. After login, provider redirects to GET /auth/callback?code=... (or similar)
- * 4. Backend exchanges code for tokens, establishes Edsby session, extracts studentId
- * 5. Backend creates short-lived JWT and redirects to edsbyai://auth-callback?token=JWT&studentId=...
- *
- * Replace the placeholder Google/OAuth and Edsby integration with your real credentials and APIs.
+ * 1. App opens GET /auth/start?school=asij → redirect to Google OAuth
+ * 2. Google redirects to GET /auth/callback?code=... → exchange for tokens, create JWT and session, redirect to app
+ * 3. App (optionally) POSTs Edsby cookies to /auth/edsby-cookies so backend can proxy to Edsby
+ * 4. App calls GET /api/proxy?path=... with Bearer JWT → backend forwards to Edsby with stored cookies
  */
 
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import fetch from 'node-fetch';
+import crypto from 'crypto';
 
 const app = express();
+app.use(express.json({ limit: '100kb' }));
+
 const PORT = process.env.PORT || 3000;
 
-// Replace with your Google OAuth client ID and secret; set redirect_uri to https://your-domain.com/auth/callback
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'YOUR_GOOGLE_CLIENT_ID';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'YOUR_GOOGLE_CLIENT_SECRET';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-jwt-secret-change-in-production';
 const APP_CALLBACK = 'edsbyai://auth-callback';
 
-// In production: store per-user Edsby session (e.g. Redis or DB). Key = state or sessionId.
+/** Session store: sessionId -> { school, studentId, cookieHeader }. Use Redis in production. */
 const edsbySessions = new Map();
 
 /**
@@ -86,17 +85,22 @@ app.get('/auth/callback', async (req, res) => {
     const tokens = await tokenRes.json();
     const idToken = tokens.id_token;
 
-    // Stub: in production, use idToken or access_token to log into Edsby (e.g. Edsby SAML/OAuth or API)
-    // and obtain the real studentId. For demo we use a placeholder.
     const studentId = await resolveEdsbyStudentId(school, idToken);
+    const sessionId = crypto.randomUUID();
+
+    edsbySessions.set(sessionId, {
+      school,
+      studentId,
+      cookieHeader: '',
+    });
 
     const appJwt = jwt.sign(
-      { sub: tokens.access_token?.slice(0, 20) || 'user', school, studentId },
+      { sub: tokens.access_token?.slice(0, 20) || 'user', school, studentId, sessionId },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    const callbackUrl = `${APP_CALLBACK}?token=${encodeURIComponent(appJwt)}&studentId=${encodeURIComponent(studentId)}`;
+    const callbackUrl = `${APP_CALLBACK}?token=${encodeURIComponent(appJwt)}&studentId=${encodeURIComponent(studentId)}&school=${encodeURIComponent(school)}`;
     res.redirect(302, callbackUrl);
   } catch (e) {
     console.error(e);
@@ -105,10 +109,51 @@ app.get('/auth/callback', async (req, res) => {
 });
 
 async function resolveEdsbyStudentId(school, googleIdToken) {
-  // Placeholder: replace with real Edsby integration (e.g. call Edsby API with Google token
-  // or open a headless session to Edsby and scrape studentId from the dashboard).
   return 'student-' + school;
 }
+
+/**
+ * POST /auth/edsby-cookies
+ * Body: { cookies: [ { name, value, domain } ], studentId?: string }
+ * Header: Authorization: Bearer <jwt>
+ * Stores Edsby cookies for this session so /api/proxy can use them.
+ */
+app.post('/auth/edsby-cookies', (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'missing_token' });
+  }
+  let payload;
+  try {
+    payload = jwt.verify(auth.slice(7), JWT_SECRET);
+  } catch (_) {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+
+  const sessionId = payload.sessionId;
+  if (!sessionId || !edsbySessions.has(sessionId)) {
+    return res.status(400).json({ error: 'session_not_found' });
+  }
+
+  const { cookies: rawCookies, studentId: newStudentId } = req.body || {};
+  if (!Array.isArray(rawCookies) || rawCookies.length === 0) {
+    return res.status(400).json({ error: 'cookies_required' });
+  }
+
+  const cookieHeader = rawCookies
+    .map((c) => (c && c.name && c.value ? `${c.name}=${encodeURIComponent(c.value)}` : null))
+    .filter(Boolean)
+    .join('; ');
+
+  const session = edsbySessions.get(sessionId);
+  session.cookieHeader = cookieHeader;
+  if (newStudentId && typeof newStudentId === 'string') {
+    session.studentId = newStudentId;
+  }
+  edsbySessions.set(sessionId, session);
+
+  return res.status(200).json({ ok: true });
+});
 
 function getBaseUrl(req) {
   const host = req.get('host') || 'localhost:' + PORT;
@@ -135,6 +180,28 @@ app.get('/auth/me', (req, res) => {
 });
 
 /**
+ * GET /auth/edsby-status
+ * Returns whether this session has Edsby cookies (so proxy will work).
+ * Used by the app to know if it should show "Link Edsby" step.
+ */
+app.get('/auth/edsby-status', (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'missing_token' });
+  }
+  let payload;
+  try {
+    payload = jwt.verify(auth.slice(7), JWT_SECRET);
+  } catch (_) {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+  const sessionId = payload.sessionId;
+  const session = sessionId ? edsbySessions.get(sessionId) : null;
+  const linked = !!(session && session.cookieHeader && session.cookieHeader.length > 0);
+  return res.status(200).json({ linked });
+});
+
+/**
  * GET /api/proxy?path=/p/BaseStudent/123
  * Forwards request to Edsby with the user's Edsby session (cookies) and returns the body.
  * Requires valid JWT; backend must have stored Edsby cookies when the user logged in.
@@ -157,13 +224,22 @@ app.get('/api/proxy', async (req, res) => {
     return res.status(400).json({ error: 'invalid_path' });
   }
 
-  // Stub: in production, look up Edsby cookies for payload.sub (or payload.studentId), then
-  // fetch https://asij.edsby.com (or school-specific host) + path with those cookies.
-  const base = 'https://asij.edsby.com';
+  const sessionId = payload.sessionId;
+  const school = payload.school || 'asij';
+  const session = sessionId ? edsbySessions.get(sessionId) : null;
+
+  if (!session || !session.cookieHeader) {
+    return res.status(503).json({ error: 'edsby_session_required', message: 'Sign in to Edsby in the app to sync your data.' });
+  }
+
+  const base = `https://${school}.edsby.com`;
   const url = base + path;
   try {
     const proxyRes = await fetch(url, {
-      headers: { /* add Edsby cookies here from your session store */ },
+      headers: {
+        Cookie: session.cookieHeader,
+        'User-Agent': 'EdsbyAI/1.0',
+      },
       redirect: 'follow',
     });
     const body = await proxyRes.text();
