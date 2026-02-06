@@ -4,6 +4,9 @@
   "description": "Minimal backend for Edsby AI app: Google → Edsby token exchange, JWT for app",
   "main": "server.js",
   "type": "module",
+  "engines": {
+    "node": ">=20.11.0"
+  },
   "scripts": {
     "start": "node server.js",
     "migrate": "node migrate.js"
