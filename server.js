@@ -836,15 +836,19 @@ async function requireAccessSession(req, res) {
 async function fetchEdsbyHtml({ school, cookieHeader, path }) {
   const base = `https://${school}.edsby.com`;
   const url = base + path;
+  console.log(`[edsby] Fetching Edsby URL: ${url}`);
+  console.log(`[edsby] Cookie header length: ${cookieHeader ? cookieHeader.length : 0}`);
   const res = await fetch(url, {
     headers: {
       Cookie: cookieHeader,
-      'User-Agent': 'EdsbyAI/1.0',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     },
     redirect: 'follow',
   });
-
   const body = await res.text();
+  console.log(`[edsby] Response status: ${res.status}`);
+  console.log(`[edsby] Response preview (first 800 chars): ${body.slice(0, 800)}`);
   return { status: res.status, headers: res.headers, body };
 }
 
