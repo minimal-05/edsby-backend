@@ -14,6 +14,14 @@ import crypto from 'crypto';
 import * as cheerio from 'cheerio';
 import Redis from 'ioredis';
 import pg from 'pg';
+import { File, Blob } from 'node:buffer';
+
+if (typeof globalThis.File === 'undefined') {
+  globalThis.File = File;
+}
+if (typeof globalThis.Blob === 'undefined') {
+  globalThis.Blob = Blob;
+}
 
 const app = express();
 app.use(express.json({ limit: '100kb' }));
@@ -23,9 +31,16 @@ const PORT = process.env.PORT || 3000;
 const { Pool } = pg;
 const DATABASE_URL = process.env.DATABASE_URL;
 const IS_PROD = process.env.NODE_ENV === 'production';
+const COOKIE_ENCRYPTION_KEY = process.env.COOKIE_ENCRYPTION_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 if (IS_PROD && !DATABASE_URL) {
   console.error('Missing DATABASE_URL in production. Refusing to start.');
+  process.exit(1);
+}
+
+if (IS_PROD && !COOKIE_ENCRYPTION_KEY) {
+  console.error('Missing COOKIE_ENCRYPTION_KEY in production. Refusing to start.');
   process.exit(1);
 }
 
@@ -55,6 +70,109 @@ const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
 
 const OAUTH_STATE_TTL_SECONDS = Number(process.env.OAUTH_STATE_TTL_SECONDS || 10 * 60);
 const EDSBY_SESSION_TTL_SECONDS = Number(process.env.EDSBY_SESSION_TTL_SECONDS || 30 * 24 * 60 * 60);
+
+async function dbQuery(text, params) {
+  if (!pool) {
+    const err = new Error('db_unavailable');
+    err.code = 'db_unavailable';
+    throw err;
+  }
+  return pool.query(text, params);
+}
+
+async function dbUpsertUser({ userId, email }) {
+  await dbQuery(
+    `INSERT INTO users (id, email, last_login_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (id)
+     DO UPDATE SET email = EXCLUDED.email, last_login_at = NOW()`,
+    [userId, email]
+  );
+}
+
+async function dbInsertRefreshToken({ jti, userId, sessionId, expiresAt }) {
+  await dbQuery(
+    `INSERT INTO refresh_tokens (jti, user_id, session_id, expires_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (jti) DO NOTHING`,
+    [jti, userId, sessionId, expiresAt]
+  );
+}
+
+async function dbGetRefreshToken(jti) {
+  const res = await dbQuery(
+    `SELECT jti, user_id, session_id, expires_at, revoked_at
+     FROM refresh_tokens
+     WHERE jti = $1`,
+    [jti]
+  );
+  return res.rows[0] || null;
+}
+
+async function dbUpsertEdsbyLink({ userId, school, status, numericStudentId, cookieJarEncrypted, linkedAt, lastValidatedAt }) {
+  await dbQuery(
+    `INSERT INTO edsby_links (
+        user_id,
+        school,
+        status,
+        numeric_student_id,
+        cookie_jar_encrypted,
+        linked_at,
+        last_validated_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+      ON CONFLICT (user_id, school)
+      DO UPDATE SET
+        status = EXCLUDED.status,
+        numeric_student_id = EXCLUDED.numeric_student_id,
+        cookie_jar_encrypted = EXCLUDED.cookie_jar_encrypted,
+        linked_at = EXCLUDED.linked_at,
+        last_validated_at = EXCLUDED.last_validated_at,
+        updated_at = NOW()`,
+    [userId, school, status, numericStudentId, cookieJarEncrypted, linkedAt, lastValidatedAt]
+  );
+}
+
+function requireCookieEncryptionKey() {
+  if (!COOKIE_ENCRYPTION_KEY || typeof COOKIE_ENCRYPTION_KEY !== 'string') {
+    const err = new Error('cookie_encryption_key_missing');
+    err.code = 'cookie_encryption_key_missing';
+    throw err;
+  }
+  const keyBuf = Buffer.from(COOKIE_ENCRYPTION_KEY, 'base64');
+  if (keyBuf.length !== 32) {
+    const err = new Error('cookie_encryption_key_invalid');
+    err.code = 'cookie_encryption_key_invalid';
+    throw err;
+  }
+  return keyBuf;
+}
+
+function encryptCookiePayload(cookiePayload) {
+  const key = requireCookieEncryptionKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const plaintext = Buffer.from(JSON.stringify(cookiePayload), 'utf8');
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ciphertext]).toString('base64');
+}
+
+function extractNumericBaseStudentIdFromHtml(html) {
+  const patterns = [
+    /\/p\/BaseStudent\/([0-9]{4,})/i,
+    /\\\/p\\\/BaseStudent\\\/([0-9]{4,})/i,
+    /BaseStudent\/([0-9]{4,})/i,
+    /BaseStudent\\\/([0-9]{4,})/i,
+    /baseStudentId"\s*:\s*"?([0-9]{4,})"?/i,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(html);
+    if (m && m[1]) return String(m[1]);
+  }
+  return null;
+}
 
 async function oauthStatePut(stateId, value) {
   if (!redis) {
@@ -152,8 +270,9 @@ function signAccessToken({ userId, school, studentId, sessionId }) {
 }
 
 function signRefreshToken({ userId, school, studentId, sessionId }) {
+  const jti = crypto.randomUUID();
   return jwt.sign(
-    { sub: userId, school, studentId, sessionId, typ: 'refresh' },
+    { sub: userId, school, studentId, sessionId, typ: 'refresh', jti },
     REFRESH_TOKEN_SECRET,
     { expiresIn: REFRESH_TOKEN_TTL_SECONDS }
   );
@@ -174,6 +293,11 @@ function verifyRefreshToken(refreshToken) {
   if (!payload || payload.typ !== 'refresh') {
     const err = new Error('invalid_token_type');
     err.code = 'invalid_token_type';
+    throw err;
+  }
+  if (!payload.jti) {
+    const err = new Error('invalid_refresh');
+    err.code = 'invalid_refresh';
     throw err;
   }
   return payload;
@@ -287,6 +411,19 @@ app.get('/auth/callback', async (req, res) => {
     const accessToken = signAccessToken({ userId, school, studentId, sessionId });
     const refreshToken = signRefreshToken({ userId, school, studentId, sessionId });
 
+    try {
+      await dbUpsertUser({ userId, email });
+      const refreshPayload = verifyRefreshToken(refreshToken);
+      const expiresAt = new Date((refreshPayload.exp || nowSeconds()) * 1000);
+      await dbInsertRefreshToken({ jti: refreshPayload.jti, userId, sessionId, expiresAt });
+    } catch (e) {
+      console.error('[db] failed to persist auth session');
+      console.error(e);
+      if (IS_PROD) {
+        return res.redirect(302, `${APP_CALLBACK}?error=server_error`);
+      }
+    }
+
     const callbackUrl = `${APP_CALLBACK}?token=${encodeURIComponent(accessToken)}&refresh=${encodeURIComponent(refreshToken)}&studentId=${encodeURIComponent(studentId)}&school=${encodeURIComponent(school)}`;
     res.redirect(302, callbackUrl);
   } catch (e) {
@@ -343,8 +480,47 @@ app.post('/auth/edsby-cookies', (req, res) => {
       if (newStudentId && typeof newStudentId === 'string') {
         next.studentId = newStudentId;
       }
+
+      let numericStudentId = null;
+      try {
+        const baseStudentRes = await fetchEdsbyHtml({
+          school: next.school || payload.school || 'asij',
+          cookieHeader: next.cookieHeader,
+          path: '/',
+        });
+        if (baseStudentRes.status >= 200 && baseStudentRes.status < 300) {
+          numericStudentId = extractNumericBaseStudentIdFromHtml(baseStudentRes.body);
+          if (numericStudentId) {
+            next.studentId = numericStudentId;
+          }
+        }
+      } catch (e) {
+        console.error('[edsby] numeric student id resolve failed');
+        console.error(e);
+      }
+
       await edsbySessionPut(sessionId, next);
-      return res.status(200).json({ ok: true });
+
+      try {
+        const encrypted = encryptCookiePayload(rawCookies);
+        await dbUpsertEdsbyLink({
+          userId: payload.sub,
+          school: (next.school || payload.school || 'asij').toLowerCase(),
+          status: 'linked',
+          numericStudentId: numericStudentId,
+          cookieJarEncrypted: encrypted,
+          linkedAt: new Date(),
+          lastValidatedAt: numericStudentId ? new Date() : null,
+        });
+      } catch (e) {
+        console.error('[db] failed to persist edsby link');
+        console.error(e);
+        if (IS_PROD) {
+          return res.status(500).json({ error: 'server_error' });
+        }
+      }
+
+      return res.status(200).json({ ok: true, studentId: next.studentId || null });
     }).catch((e) => {
       console.error('edsbySessionGet/Put failed', e);
       return res.status(500).json({ error: 'server_error' });
@@ -404,6 +580,16 @@ app.post('/auth/refresh', async (req, res) => {
 
   try {
     const payload = verifyRefreshToken(refresh);
+    try {
+      const record = await dbGetRefreshToken(payload.jti);
+      if (!record || record.revoked_at) {
+        return res.status(401).json({ error: 'invalid_refresh' });
+      }
+    } catch (e) {
+      console.error('[db] refresh token lookup failed');
+      console.error(e);
+      if (IS_PROD) return res.status(500).json({ error: 'server_error' });
+    }
     const sessionId = payload.sessionId;
     const session = sessionId ? await edsbySessionGet(sessionId) : null;
 
@@ -520,7 +706,7 @@ async function requireAccessSession(req, res) {
     payload,
     session,
     school: payload.school || session.school || 'asij',
-    studentId: payload.studentId || session.studentId,
+    studentId: session.studentId || payload.studentId,
   };
 }
 
@@ -828,9 +1014,100 @@ app.get('/edsby/ping', (req, res) => {
   }
 
   const sessionId = payload.sessionId;
-  const session = sessionId ? edsbySessions.get(sessionId) : null;
-  const linked = !!(session && session.cookieHeader && session.cookieHeader.length > 0);
-  return res.status(200).json({ linked });
+  Promise.resolve(sessionId ? edsbySessionGet(sessionId) : null).then((session) => {
+    const linked = !!(session && session.cookieHeader && session.cookieHeader.length > 0);
+    return res.status(200).json({ linked });
+  }).catch((e) => {
+    console.error('edsbySessionGet failed', e);
+    return res.status(500).json({ error: 'server_error' });
+  });
+});
+
+app.post('/api/v1/ai/chat', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'missing_token' });
+  }
+  let payload;
+  try {
+    payload = verifyAccessToken(auth.slice(7));
+  } catch (_) {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+
+  if (!OPENAI_API_KEY) {
+    return res.status(503).json({ error: 'ai_not_configured' });
+  }
+
+  const { message, context } = req.body || {};
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ error: 'message_required' });
+  }
+
+  const userKey = String(payload.sub || 'user');
+
+  if (redis) {
+    const key = `rl:ai:${userKey}`;
+    try {
+      const count = await redis.incr(key);
+      if (count === 1) {
+        await redis.expire(key, 60);
+      }
+      if (count > 20) {
+        return res.status(429).json({ error: 'rate_limited' });
+      }
+    } catch (e) {
+      console.error('[redis] rate limit failed');
+      console.error(e);
+    }
+  }
+
+  const contextText = typeof context === 'string' ? context.slice(0, 8000) : '';
+  const userMsg = message.slice(0, 4000);
+
+  try {
+    const aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a helpful student assistant. Use the provided context if present. Keep answers concise and actionable.',
+          },
+          ...(contextText
+            ? [
+                {
+                  role: 'system',
+                  content: `Context:\n${contextText}`,
+                },
+              ]
+            : []),
+          { role: 'user', content: userMsg },
+        ],
+        temperature: 0.4,
+      }),
+    });
+
+    if (!aiRes.ok) {
+      const body = await aiRes.text();
+      console.error('[ai] upstream error', aiRes.status, body.slice(0, 500));
+      return res.status(502).json({ error: 'ai_upstream_error' });
+    }
+
+    const data = await aiRes.json();
+    const text = data?.choices?.[0]?.message?.content;
+    return res.status(200).json({ reply: typeof text === 'string' ? text : '' });
+  } catch (e) {
+    console.error('[ai] request failed');
+    console.error(e);
+    return res.status(502).json({ error: 'ai_request_failed' });
+  }
 });
 
 async function start() {
