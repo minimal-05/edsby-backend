@@ -853,18 +853,24 @@ function isEdsbySessionRequiredStatus(status) {
 }
 
 function extractCourseIdsAndNames(html) {
+  console.log('[edsby] extractCourseIdsAndNames: parsing HTML (first 2000 chars):', html.slice(0, 2000));
   const $ = cheerio.load(html);
   // Primary selector: direct course links
   let links = $('a[href^="/p/Course/"]');
+  console.log('[edsby] Primary selector found links:', links.length);
   if (links.length === 0) {
     // Fallback selectors
     links = $('.course-card a');
+    console.log('[edsby] Fallback .course-card a found links:', links.length);
     if (links.length === 0) {
       links = $('[data-course-id]');
+      console.log('[edsby] Fallback [data-course-id] found links:', links.length);
       if (links.length === 0) {
         links = $('a[href*="/p/Course/"]');
+        console.log('[edsby] Fallback a[href*="/p/Course/"] found links:', links.length);
         if (links.length === 0) {
           links = $('a[href*="Course/"]');
+          console.log('[edsby] Fallback a[href*="Course/"] found links:', links.length);
         }
       }
     }
@@ -881,6 +887,7 @@ function extractCourseIdsAndNames(html) {
 
   // If still no courses, try regex patterns
   if (courses.length === 0) {
+    console.log('[edsby] No links found, trying regex patterns');
     const patterns = [
       /\/p\/Course\/([A-Za-z0-9_-]+)/gi,
       /\\\/p\\\/Course\\\/([A-Za-z0-9_-]+)/gi,
@@ -900,6 +907,7 @@ function extractCourseIdsAndNames(html) {
       }
     }
 
+    console.log('[edsby] Regex patterns extracted IDs:', Array.from(ids));
     ids.forEach(id => courses.push({ id, name: 'Course', currentGrade: null }));
   }
 
@@ -908,6 +916,7 @@ function extractCourseIdsAndNames(html) {
     if (!uniqueById.has(c.id)) uniqueById.set(c.id, c);
   }
 
+  console.log('[edsby] Final unique courses count:', uniqueById.size);
   return uniqueById.size > 0 ? Array.from(uniqueById.values()) : [];
 }
 
