@@ -20,6 +20,163 @@ import { File, Blob } from 'node:buffer';
 if (typeof globalThis.File === 'undefined') {
   globalThis.File = File;
 }
+
+async function withPlaywrightContext({ school, cookieHeader }, fn) {
+  const browser = await chromium.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+  try {
+    const context = await browser.newContext({
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+    });
+
+    const cookies = String(cookieHeader || '')
+      .split(';')
+      .map((c) => c.trim())
+      .filter(Boolean)
+      .map((pair) => {
+        const idx = pair.indexOf('=');
+        if (idx <= 0) return null;
+        const name = pair.slice(0, idx).trim();
+        const value = pair.slice(idx + 1).trim();
+        return {
+          name,
+          value,
+          domain: `${school}.edsby.com`,
+          path: '/',
+          httpOnly: false,
+          secure: true,
+          sameSite: 'Lax',
+        };
+      })
+      .filter(Boolean);
+
+    if (cookies.length) {
+      await context.addCookies(cookies);
+    }
+
+    const page = await context.newPage();
+    const result = await fn({ page, context });
+    await context.close();
+    return result;
+  } finally {
+    await browser.close();
+  }
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function captureEdsbyJsonFromPage({ school, cookieHeader, url }) {
+  const captured = [];
+  await withPlaywrightContext({ school, cookieHeader }, async ({ page }) => {
+    page.on('response', async (resp) => {
+      try {
+        const ct = (resp.headers()['content-type'] || '').toLowerCase();
+        if (!ct.includes('application/json') && !ct.includes('+json')) return;
+        const bodyText = await resp.text();
+        const json = safeJsonParse(bodyText);
+        if (!json) return;
+        captured.push({ url: resp.url(), status: resp.status(), json });
+      } catch (_) {}
+    });
+
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+    // Give late XHR a moment.
+    await page.waitForTimeout(1200);
+  });
+
+  return captured;
+}
+
+function extractPostsFromCapturedJson(captures, courseId) {
+  // Heuristic: find arrays of feed-like items with title/subject and body/content.
+  const posts = [];
+
+  function walk(node) {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (typeof node !== 'object') return;
+
+    // Candidate post object
+    const title = node.title || node.subject || node.headline;
+    const body = node.body || node.content || node.text;
+    const createdAt = node.createdAt || node.created_at || node.date || node.timestamp;
+    const id = node.id || node.postId || node.post_id;
+    if ((title || body) && (id != null || createdAt != null)) {
+      posts.push({
+        id: String(id != null ? id : crypto.randomUUID()),
+        title: String(title || 'Post'),
+        body: String(body || ''),
+        createdAt: createdAt != null ? String(createdAt) : null,
+        courseId,
+      });
+    }
+
+    for (const v of Object.values(node)) walk(v);
+  }
+
+  for (const c of captures) walk(c.json);
+
+  // Dedupe by id
+  const byId = new Map();
+  for (const p of posts) {
+    if (!byId.has(p.id)) byId.set(p.id, p);
+  }
+  return Array.from(byId.values());
+}
+
+function extractAssignmentsFromCapturedJson(captures, courseId) {
+  const items = [];
+
+  function walk(node) {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (typeof node !== 'object') return;
+
+    const name = node.name || node.title;
+    const dueDate = node.dueDate || node.due_date || node.due;
+    const grade = node.grade || node.score || node.mark;
+    const points = node.points || node.outOf || node.out_of;
+    const category = node.category || node.type;
+    const id = node.id || node.assignmentId || node.assignment_id;
+
+    // Candidate assignment object
+    if (name && (dueDate || grade || points)) {
+      items.push({
+        id: String(id != null ? id : crypto.randomUUID()),
+        name: String(name),
+        dueDate: dueDate != null ? String(dueDate) : null,
+        grade: grade != null && String(grade).length ? String(grade) : null,
+        points: points != null && String(points).length ? String(points) : null,
+        category: category != null && String(category).length ? String(category) : null,
+        courseId,
+      });
+    }
+
+    for (const v of Object.values(node)) walk(v);
+  }
+
+  for (const c of captures) walk(c.json);
+  const byId = new Map();
+  for (const a of items) {
+    if (!byId.has(a.id)) byId.set(a.id, a);
+  }
+  return Array.from(byId.values());
+}
 if (typeof globalThis.Blob === 'undefined') {
   globalThis.Blob = Blob;
 }
@@ -1119,35 +1276,34 @@ app.get('/edsby/course/:courseId/posts', async (req, res) => {
   if (!ctx) return;
 
   const { session, school } = ctx;
-  const courseId = req.params.courseId;
-  const htmlRes = await fetchEdsbyHtml({ school, cookieHeader: session.cookieHeader, path: `/p/Course/${courseId}` });
-  if (isEdsbySessionRequiredStatus(htmlRes.status)) {
+  const courseId = String(req.params.courseId || '').trim();
+  if (!courseId) {
+    return res.status(400).json({ error: 'invalid_course_id' });
+  }
+
+  const url = `https://${school}.edsby.com/p/Course/${courseId}`;
+
+  // JSON/XHR first
+  try {
+    const captures = await captureEdsbyJsonFromPage({ school, cookieHeader: session.cookieHeader, url });
+    const posts = extractPostsFromCapturedJson(captures, courseId);
+    if (posts.length) {
+      return res.status(200).json({ courseId, posts, source: 'xhr' });
+    }
+  } catch (e) {
+    console.error('[edsby] posts xhr capture failed', e);
+  }
+
+  // Fallback: rendered DOM
+  const rendered = await fetchEdsbyRenderedHtml({ school, cookieHeader: session.cookieHeader, path: `/p/Course/${courseId}` });
+  if (isEdsbySessionRequiredStatus(rendered.status)) {
     return res.status(503).json({ error: 'edsby_session_required' });
   }
-  if (htmlRes.status < 200 || htmlRes.status >= 300) {
-    return res.status(502).json({ error: 'edsby_upstream_error', status: htmlRes.status });
+  if (rendered.status < 200 || rendered.status >= 300) {
+    return res.status(502).json({ error: 'edsby_upstream_error', status: rendered.status });
   }
-
-  const posts = extractPosts(htmlRes.body, courseId);
-  return res.status(200).json({ posts });
-});
-
-app.get('/edsby/course/:courseId/docs', async (req, res) => {
-  const ctx = await requireAccessSession(req, res);
-  if (!ctx) return;
-
-  const { session, school } = ctx;
-  const courseId = req.params.courseId;
-  const htmlRes = await fetchEdsbyHtml({ school, cookieHeader: session.cookieHeader, path: `/p/Course/${courseId}` });
-  if (isEdsbySessionRequiredStatus(htmlRes.status)) {
-    return res.status(503).json({ error: 'edsby_session_required' });
-  }
-  if (htmlRes.status < 200 || htmlRes.status >= 300) {
-    return res.status(502).json({ error: 'edsby_upstream_error', status: htmlRes.status });
-  }
-
-  const linkedDocs = extractGoogleDocs(htmlRes.body, courseId);
-  return res.status(200).json({ linkedDocs });
+  const posts = extractPosts(rendered.body || '', courseId);
+  return res.status(200).json({ courseId, posts, source: 'rendered_dom' });
 });
 
 app.get('/edsby/course/:courseId/grades', async (req, res) => {
@@ -1155,7 +1311,25 @@ app.get('/edsby/course/:courseId/grades', async (req, res) => {
   if (!ctx) return;
 
   const { session, school, studentId } = ctx;
-  const courseId = req.params.courseId;
+  const courseId = String(req.params.courseId || '').trim();
+  if (!courseId) {
+    return res.status(400).json({ error: 'invalid_course_id' });
+  }
+
+  const url = `https://${school}.edsby.com/p/MyWorkStudent/${courseId}?student=${encodeURIComponent(studentId)}`;
+
+  // JSON/XHR first
+  try {
+    const captures = await captureEdsbyJsonFromPage({ school, cookieHeader: session.cookieHeader, url });
+    const grades = extractAssignmentsFromCapturedJson(captures, courseId);
+    if (grades.length) {
+      return res.status(200).json({ courseId, grades, source: 'xhr' });
+    }
+  } catch (e) {
+    console.error('[edsby] grades xhr capture failed', e);
+  }
+
+  // Fallback: static HTML fetch + parse (grades table often server-rendered)
   const htmlRes = await fetchEdsbyHtml({
     school,
     cookieHeader: session.cookieHeader,
@@ -1168,8 +1342,8 @@ app.get('/edsby/course/:courseId/grades', async (req, res) => {
     return res.status(502).json({ error: 'edsby_upstream_error', status: htmlRes.status });
   }
 
-  const grades = extractAssignments(htmlRes.body, courseId);
-  return res.status(200).json({ grades });
+  const grades = extractAssignments(htmlRes.body || '', courseId);
+  return res.status(200).json({ courseId, grades, source: 'html' });
 });
 
 app.get('/edsby/all', async (req, res) => {
