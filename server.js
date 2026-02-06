@@ -14,6 +14,7 @@ import crypto from 'crypto';
 import * as cheerio from 'cheerio';
 import Redis from 'ioredis';
 import pg from 'pg';
+import { chromium } from 'playwright';
 import { File, Blob } from 'node:buffer';
 
 if (typeof globalThis.File === 'undefined') {
@@ -852,6 +853,62 @@ async function fetchEdsbyHtml({ school, cookieHeader, path }) {
   return { status: res.status, headers: res.headers, body };
 }
 
+async function fetchEdsbyRenderedHtml({ school, cookieHeader, path }) {
+  const base = `https://${school}.edsby.com`;
+  const url = base + path;
+  console.log(`[edsby] (playwright) Rendering URL: ${url}`);
+
+  const browser = await chromium.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+  try {
+    const context = await browser.newContext({
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+    });
+
+    // Convert Cookie header string to Playwright cookie objects
+    const cookies = String(cookieHeader || '')
+      .split(';')
+      .map((c) => c.trim())
+      .filter(Boolean)
+      .map((pair) => {
+        const idx = pair.indexOf('=');
+        if (idx <= 0) return null;
+        const name = pair.slice(0, idx).trim();
+        const value = pair.slice(idx + 1).trim();
+        return {
+          name,
+          value,
+          domain: `${school}.edsby.com`,
+          path: '/',
+          httpOnly: false,
+          secure: true,
+          sameSite: 'Lax',
+        };
+      })
+      .filter(Boolean);
+
+    if (cookies.length) {
+      await context.addCookies(cookies);
+    }
+
+    const page = await context.newPage();
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+    const html = await page.content();
+    console.log(`[edsby] (playwright) Rendered HTML length: ${html.length}`);
+    console.log(`[edsby] (playwright) Rendered preview (first 800 chars): ${html.slice(0, 800)}`);
+    await context.close();
+    return { status: 200, headers: new Map(), body: html };
+  } catch (e) {
+    console.error('[edsby] (playwright) render failed', e);
+    return { status: 599, headers: new Map(), body: '' };
+  } finally {
+    await browser.close();
+  }
+}
+
 function isEdsbySessionRequiredStatus(status) {
   return status === 302 || status === 401 || status === 403;
 }
@@ -1147,6 +1204,24 @@ app.get('/edsby/all', async (req, res) => {
         console.log('[edsby] Found courses on BaseStudent page:', courses.length);
       }
     }
+  }
+
+  // Final fallback: render via Playwright and re-extract courses/schedule
+  if (courses.length === 0) {
+    console.log('[edsby] No courses found via static fetch; trying Playwright-rendered homepage');
+    const rendered = await fetchEdsbyRenderedHtml({ school, cookieHeader: session.cookieHeader, path: '/' });
+    if (rendered.status >= 200 && rendered.status < 300 && rendered.body) {
+      courses = extractCourseIdsAndNames(rendered.body);
+      schedule = extractScheduleItems(rendered.body);
+      console.log('[edsby] Found courses via Playwright:', courses.length);
+    }
+  }
+
+  if (courses.length === 0) {
+    return res.status(502).json({
+      error: 'edsby_extract_failed',
+      message: 'Could not extract courses from Edsby pages.',
+    });
   }
 
   console.log('[edsby] Extracted courses count:', courses.length, 'schedule count:', schedule.length);
