@@ -985,19 +985,20 @@ app.get('/edsby/all', async (req, res) => {
 
   console.log('[edsby] /edsby/all using studentId:', studentId, 'school:', school);
 
-  const baseStudentRes = await fetchEdsbyHtml({ school, cookieHeader: session.cookieHeader, path: `/p/BaseStudent/${studentId}` });
-  console.log('[edsby] BaseStudent status:', baseStudentRes.status);
-  console.log('[edsby] BaseStudent preview (first 800 chars):', baseStudentRes.body.slice(0, 800));
+  // Fetch homepage to extract courses; BaseStudent page often has minimal content
+  const homeRes = await fetchEdsbyHtml({ school, cookieHeader: session.cookieHeader, path: '/' });
+  console.log('[edsby] Homepage status:', homeRes.status);
+  console.log('[edsby] Homepage preview (first 800 chars):', homeRes.body.slice(0, 800));
 
-  if (baseStudentRes.status < 200 || baseStudentRes.status >= 300) {
-    if (isEdsbySessionRequiredStatus(baseStudentRes.status)) {
+  if (homeRes.status < 200 || homeRes.status >= 300) {
+    if (isEdsbySessionRequiredStatus(homeRes.status)) {
       return res.status(503).json({ error: 'edsby_session_required' });
     }
-    return res.status(502).json({ error: 'edsby_upstream_error', status: baseStudentRes.status });
+    return res.status(502).json({ error: 'edsby_upstream_error', status: homeRes.status });
   }
 
-  const courses = extractCourseIdsAndNames(baseStudentRes.body);
-  const schedule = extractScheduleItems(baseStudentRes.body);
+  const courses = extractCourseIdsAndNames(homeRes.body);
+  const schedule = extractScheduleItems(homeRes.body);
 
   console.log('[edsby] Extracted courses count:', courses.length, 'schedule count:', schedule.length);
 
