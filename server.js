@@ -483,24 +483,43 @@ app.get('/auth/callback', async (req, res) => {
  */
 async function resolveEdsbyStudentId(school, googleIdToken) {
   try {
-    // First, attempt to authenticate with Edsby using Google token
-    // Edsby may support Google federation; if not, we'll fall back to a login flow
-    const edsbyLoginUrl = `https://${school}.edsby.com/p/`;
-    const loginRes = await fetch(edsbyLoginUrl, {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; EdsbyAI/1.0)',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      },
-      redirect: 'manual', // Prevent auto-redirect to capture cookies
-    });
+    // Try common Edsby URL patterns
+    const possibleUrls = [
+      `https://${school}.edsby.com`,
+      `https://${school}.edsby.com/p/`,
+      `https://${school}.edsby.com/home`,
+      `https://edsby.com/${school}`,
+    ];
 
-    if (loginRes.status !== 200) {
-      console.warn('[edsby] Failed to load Edsby login page:', loginRes.status);
+    let loginHtml = null;
+    let workingUrl = null;
+
+    for (const url of possibleUrls) {
+      console.log(`[edsby] Trying Edsby URL: ${url}`);
+      const loginRes = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; EdsbyAI/1.0)',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        },
+        redirect: 'manual', // Prevent auto-redirect to capture cookies
+      });
+
+      if (loginRes.status === 200) {
+        loginHtml = await loginRes.text();
+        workingUrl = url;
+        console.log(`[edsby] Successfully loaded Edsby page from: ${url}`);
+        break;
+      } else {
+        console.warn(`[edsby] Failed to load ${url}: ${loginRes.status}`);
+      }
+    }
+
+    if (!loginHtml) {
+      console.warn('[edsby] Could not load any Edsby URL');
       return null;
     }
 
-    const loginHtml = await loginRes.text();
     // Look for Google sign-in button or form to extract Google OAuth URL for Edsby
     const googleSignInMatch = loginHtml.match(/href=["']([^"']+)["'][^>]*Google[^<]*Sign[^<]*In/i);
     if (googleSignInMatch) {
