@@ -485,9 +485,10 @@ async function resolveEdsbyStudentId(school, googleIdToken) {
   try {
     // Try common Edsby URL patterns
     const possibleUrls = [
-      `https://${school}.edsby.com`,
+      `https://${school}.edsby.com/p/BaseStudent`,
       `https://${school}.edsby.com/p/`,
       `https://${school}.edsby.com/home`,
+      `https://${school}.edsby.com`,
       `https://edsby.com/${school}`,
     ];
 
