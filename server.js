@@ -330,6 +330,23 @@ async function dbUpsertEdsbyLink({ userId, school, status, numericStudentId, coo
   );
 }
 
+async function dbGetEdsbyLink(userId, school) {
+  const res = await dbQuery(
+    `SELECT user_id,
+            school,
+            status,
+            numeric_student_id,
+            cookie_jar_encrypted,
+            linked_at,
+            last_validated_at,
+            updated_at
+       FROM edsby_links
+      WHERE user_id = $1 AND school = $2`,
+    [userId, school]
+  );
+  return res.rows[0] || null;
+}
+
 // COOKIE_ENCRYPTION_KEY is now derived from JWT_SECRET; no need for requireCookieEncryptionKey
 
 function encryptCookiePayload(cookiePayload) {
@@ -340,6 +357,29 @@ function encryptCookiePayload(cookiePayload) {
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
   return Buffer.concat([iv, tag, ciphertext]).toString('base64');
+}
+
+function decryptCookiePayload(encryptedBase64) {
+  const key = COOKIE_ENCRYPTION_KEY;
+  const raw = Buffer.from(String(encryptedBase64 || ''), 'base64');
+  if (raw.length < 12 + 16 + 1) {
+    throw new Error('cookie_payload_invalid');
+  }
+  const iv = raw.subarray(0, 12);
+  const tag = raw.subarray(12, 28);
+  const ciphertext = raw.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return JSON.parse(plaintext.toString('utf8'));
+}
+
+function cookieJarToCookieHeader(cookieJar) {
+  if (!Array.isArray(cookieJar) || cookieJar.length === 0) return '';
+  return cookieJar
+    .map((c) => (c && c.name && c.value != null ? `${c.name}=${String(c.value)}` : null))
+    .filter(Boolean)
+    .join('; ');
 }
 
 function extractNumericBaseStudentIdFromHtml(html) {
@@ -847,17 +887,47 @@ app.get('/auth/edsby-status', async (req, res) => {
     return res.status(200).json({ status: 'needs_link' });
   }
 
+  let cookieHeader = '';
+  try {
+    const jar = decryptCookiePayload(link.cookie_jar_encrypted);
+    cookieHeader = cookieJarToCookieHeader(jar);
+  } catch (e) {
+    console.error('[auth] failed to decrypt cookie jar for status');
+    console.error(e);
+    return res.status(200).json({
+      status: 'expired',
+      numericStudentId: link.numeric_student_id || null,
+      lastValidatedAt: link.last_validated_at || null,
+    });
+  }
+
+  if (!cookieHeader) {
+    return res.status(200).json({
+      status: 'expired',
+      numericStudentId: link.numeric_student_id || null,
+      lastValidatedAt: link.last_validated_at || null,
+    });
+  }
+
   // Quick validation: HEAD request to Edsby homepage with stored cookies
   let isValid = false;
   try {
-    const resp = await fetchEdsbyHtml({ school, cookieHeader: link.cookie_header, path: '/', method: 'HEAD' });
-    isValid = resp.status >= 200 && resp.status < 300 && !isEdsbySessionRequiredStatus(resp.status);
+    const resp = await fetchEdsbyHtml({ school, cookieHeader, path: '/', method: 'HEAD' });
+    if (isEdsbySessionRequiredStatus(resp.status)) {
+      isValid = false;
+    } else {
+      isValid = resp.status >= 200 && resp.status < 400;
+    }
   } catch (_) {
     isValid = false;
   }
 
   if (!isValid) {
-    return res.status(200).json({ status: 'expired', numericStudentId: link.numeric_student_id, lastValidatedAt: link.last_validated_at });
+    return res.status(200).json({
+      status: 'expired',
+      numericStudentId: link.numeric_student_id || null,
+      lastValidatedAt: link.last_validated_at || null,
+    });
   }
 
   // Update lastValidatedAt if still valid
@@ -865,8 +935,8 @@ app.get('/auth/edsby-status', async (req, res) => {
 
   return res.status(200).json({
     status: 'linked',
-    numericStudentId: link.numeric_student_id,
-    lastValidatedAt: link.last_validated_at,
+    numericStudentId: link.numeric_student_id || null,
+    lastValidatedAt: link.last_validated_at || null,
   });
 });
 
