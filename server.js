@@ -830,6 +830,57 @@ function getBaseUrl(req) {
 }
 
 /**
+ * GET /auth/edsby-status
+ * Returns deterministic Edsby link status for the authenticated user.
+ * Response:
+ *   { status: 'linked', numericStudentId: '1234', lastValidatedAt: '2026-02-07T...' }
+ *   { status: 'needs_link' }          // No row in edsby_links
+ *   { status: 'expired' }             // Row exists but cookies fail validation
+ */
+app.get('/auth/edsby-status', async (req, res) => {
+  const ctx = await requireAccessSession(req, res);
+  if (!ctx) return;
+  const { session, school, studentId } = ctx;
+
+  const link = await dbGetEdsbyLink(ctx.userId, school);
+  if (!link) {
+    return res.status(200).json({ status: 'needs_link' });
+  }
+
+  // Quick validation: HEAD request to Edsby homepage with stored cookies
+  let isValid = false;
+  try {
+    const resp = await fetchEdsbyHtml({ school, cookieHeader: link.cookie_header, path: '/', method: 'HEAD' });
+    isValid = resp.status >= 200 && resp.status < 300 && !isEdsbySessionRequiredStatus(resp.status);
+  } catch (_) {
+    isValid = false;
+  }
+
+  if (!isValid) {
+    return res.status(200).json({ status: 'expired', numericStudentId: link.numeric_student_id, lastValidatedAt: link.last_validated_at });
+  }
+
+  // Update lastValidatedAt if still valid
+  await dbUpdateEdsbyLinkValidation(ctx.userId, school, new Date());
+
+  return res.status(200).json({
+    status: 'linked',
+    numericStudentId: link.numeric_student_id,
+    lastValidatedAt: link.last_validated_at,
+  });
+});
+
+// Helper to update last_validated_at
+async function dbUpdateEdsbyLinkValidation(userId, school, timestamp) {
+  await dbQuery(
+    `UPDATE edsby_links
+     SET last_validated_at = $1, updated_at = NOW()
+     WHERE user_id = $2 AND school = $3`,
+    [timestamp, userId, school]
+  );
+}
+
+/**
  * GET /auth/me
  * Validates Bearer JWT and returns 200. Used by the app to validate session.
  */
@@ -919,53 +970,10 @@ app.get('/auth/edsby-status', (req, res) => {
   });
 });
 
-/**
- * GET /api/proxy?path=/p/BaseStudent/123
- * Forwards request to Edsby with the user's Edsby session (cookies) and returns the body.
- * Requires valid JWT; backend must have stored Edsby cookies when the user logged in.
- * This is a stub: you must implement storing/retrieving Edsby cookies per user (e.g. by JWT sub).
- */
+// Legacy: deprecated. Use /edsby/* endpoints instead.
+// Returns 503 for all requests to discourage use.
 app.get('/api/proxy', async (req, res) => {
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'missing_token' });
-  }
-  let payload;
-  try {
-    payload = verifyAccessToken(auth.slice(7));
-  } catch (_) {
-    return res.status(401).json({ error: 'invalid_token' });
-  }
-
-  const path = req.query.path;
-  if (!path || !path.startsWith('/')) {
-    return res.status(400).json({ error: 'invalid_path' });
-  }
-
-  const sessionId = payload.sessionId;
-  const school = payload.school || 'asij';
-  const session = sessionId ? await edsbySessionGet(sessionId) : null;
-
-  if (!session || !session.cookieHeader) {
-    return res.status(503).json({ error: 'edsby_session_required', message: 'Sign in to Edsby in the app to sync your data.' });
-  }
-
-  const base = `https://${school}.edsby.com`;
-  const url = base + path;
-  try {
-    const proxyRes = await fetch(url, {
-      headers: {
-        Cookie: session.cookieHeader,
-        'User-Agent': 'EdsbyAI/1.0',
-      },
-      redirect: 'follow',
-    });
-    const body = await proxyRes.text();
-    res.status(proxyRes.status).contentType(proxyRes.headers.get('content-type') || 'text/html').send(body);
-  } catch (e) {
-    console.error(e);
-    res.status(502).json({ error: 'proxy_failed' });
-  }
+  res.status(503).json({ error: 'deprecated', message: 'Use /edsby/* endpoints instead.' });
 });
 
 async function requireAccessSession(req, res) {
@@ -1000,27 +1008,29 @@ async function requireAccessSession(req, res) {
   };
 }
 
-async function fetchEdsbyHtml({ school, cookieHeader, path }) {
-  const base = `https://${school}.edsby.com`;
-  const url = base + path;
-  if (EDSBY_DEBUG) {
-    console.log(`[edsby] Fetching Edsby URL: ${url}`);
-    console.log(`[edsby] Cookie header length: ${cookieHeader ? cookieHeader.length : 0}`);
+async function fetchEdsbyHtml({ school, cookieHeader, path = '/', method = 'GET' }) {
+  const url = `https://${school}.edsby.com${path}`;
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+  };
+  if (cookieHeader) {
+    headers.Cookie = cookieHeader;
   }
-  const res = await fetch(url, {
-    headers: {
-      Cookie: cookieHeader,
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    },
-    redirect: 'follow',
-  });
-  const body = await res.text();
-  if (EDSBY_DEBUG) {
-    console.log(`[edsby] Response status: ${res.status}`);
-    console.log(`[edsby] Response preview (first 800 chars): ${body.slice(0, 800)}`);
+
+  const resp = await fetch(url, { method, headers, redirect: 'manual' });
+  let body;
+  if (method.toUpperCase() === 'HEAD') {
+    body = null;
+  } else {
+    const text = await resp.text();
+    body = text;
   }
-  return { status: res.status, headers: res.headers, body };
+  return { status: resp.status, headers: resp.headers, body };
 }
 
 async function fetchEdsbyRenderedHtml({ school, cookieHeader, path }) {
@@ -1456,27 +1466,9 @@ app.get('/edsby/all', async (req, res) => {
   });
 });
 
+// Legacy: deprecated. Use /auth/edsby-status instead.
 app.get('/edsby/ping', (req, res) => {
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'missing_token' });
-  }
-
-  let payload;
-  try {
-    payload = verifyAccessToken(auth.slice(7));
-  } catch (_) {
-    return res.status(401).json({ error: 'invalid_token' });
-  }
-
-  const sessionId = payload.sessionId;
-  Promise.resolve(sessionId ? edsbySessionGet(sessionId) : null).then((session) => {
-    const linked = !!(session && session.cookieHeader && session.cookieHeader.length > 0);
-    return res.status(200).json({ linked });
-  }).catch((e) => {
-    console.error('edsbySessionGet failed', e);
-    return res.status(500).json({ error: 'server_error' });
-  });
+  res.status(503).json({ error: 'deprecated', message: 'Use /auth/edsby-status instead.' });
 });
 
 app.post('/api/v1/ai/chat', async (req, res) => {
